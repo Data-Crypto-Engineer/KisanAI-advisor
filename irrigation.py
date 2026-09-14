@@ -1,9 +1,11 @@
 """
 irrigation.py - Weather-Linked Irrigation Module for KisanAI Advisor
-Retrieves Open-Meteo forecasts and applies FAO ET0 agronomic irrigation rules.
+Retrieves Open-Meteo forecasts and applies FAO ET0 agronomic irrigation rules
+with multi-model fallback to prevent 503 errors.
 """
 
 from typing import Dict, Any, Optional
+import os
 import requests
 
 PAKISTANI_DISTRICTS = [
@@ -137,3 +139,62 @@ def evaluate_irrigation_need(
         "reason": f"Mild weather ({max_temp}°C, ET₀ {et0} mm) with dry forecast ({rain_3day} mm).",
         "guidance": "Inspect crop visual vigor. Irrigate only if leaves show midday rolling."
     }
+
+
+def get_irrigation_gemini_explanation(crop: str, recommendation: str, reason: str, weather_summary: str) -> Dict[str, Any]:
+    """
+    Generates plain-language explanation with multi-model fallback to survive 503 high demand spikes.
+    Falls back gracefully to local rule-based explanation if all models are busy.
+    """
+    disclaimer = (
+        "⚠️ DISCLAIMER: These alerts are automated advisory recommendations. Always inspect soil "
+        "firmness and moisture physically before operating tube-wells or taking canal water turn (wari)."
+    )
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return {
+            "explanation": reason,
+            "disclaimer": disclaimer,
+            "source": "Local Rule-Based Agronomy Model"
+        }
+    
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            f"You are an agricultural advisor talking to a farmer in Pakistan. "
+            f"Crop: {crop}. Rule Recommendation: {recommendation}. Agronomic Reason: {reason}. "
+            f"Weather data: {weather_summary}. "
+            f"Explain in 2 friendly, easy-to-understand sentences why this recommendation was given and one practical tip "
+            f"the farmer should remember (e.g. irrigating during early morning or avoiding water waste)."
+        )
+        
+        # Try candidate models to avoid 503 temporary demand spikes
+        candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
+        text_output = None
+        for mod in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=mod,
+                    contents=prompt,
+                )
+                if response.text and response.text.strip():
+                    text_output = response.text.strip()
+                    break
+            except Exception:
+                continue
+        
+        if not text_output:
+            text_output = reason
+            
+        return {
+            "explanation": text_output,
+            "disclaimer": disclaimer,
+            "source": "Gemini AI Advisor" if text_output != reason else "Local Rule-Based Agronomy Model"
+        }
+    except Exception:
+        return {
+            "explanation": reason,
+            "disclaimer": disclaimer,
+            "source": "Local Rule-Based Agronomy Model"
+        }
