@@ -1,6 +1,6 @@
 """
 disease.py - Crop Leaf Disease Detection Module for KisanAI Advisor
-Lightweight deployment version for Streamlit Community Cloud.
+Lightweight deployment version for Streamlit Community Cloud with 503 resilience.
 """
 
 from typing import Dict, Any, Optional
@@ -124,7 +124,6 @@ def predict_disease(image: Image.Image, model=None, crop_hint: str = "Wheat") ->
             model = None
 
     if model is None:
-        # Agronomic color and texture heuristic
         img_np = np.array(image.convert("RGB"))
         r_mean = float(np.mean(img_np[:, :, 0]))
         g_mean = float(np.mean(img_np[:, :, 1]))
@@ -172,3 +171,62 @@ def predict_disease(image: Image.Image, model=None, crop_hint: str = "Wheat") ->
         "steps": kb_info["steps"],
         "warning": "⚠️ IMPORTANT: Always consult a local agricultural extension expert (Zaraat Department) before applying chemical pesticides or fungicides."
     }
+
+
+def get_disease_gemini_explanation(disease_name: str, crop: str, confidence_pct: float) -> Dict[str, Any]:
+    """Generates an explanation using Gemini with multi-model fallback and agronomic rules if busy."""
+    fallback = DISEASE_KB.get(disease_name, {
+        "summary": f"Visual symptoms observed consistent with {disease_name} in {crop}.",
+        "steps": [
+            "Isolate affected plants and monitor adjacent rows.",
+            "Consult Zaraat Markaz before applying chemical pesticides."
+        ]
+    })
+    
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        return {
+            "explanation": fallback["summary"],
+            "suggested_steps": fallback["steps"],
+            "source": "Agricultural Extension Knowledgebase (Predefined)"
+        }
+    
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            f"You are an expert agricultural extension advisor for Pakistani smallholder wheat and rice farmers. "
+            f"A farmer's {crop} crop leaf has been classified as '{disease_name}' with {confidence_pct:.1f}% confidence. "
+            f"Provide a concise, 2-sentence explanation of what this symptom means for the crop and two practical immediate steps. "
+            f"Remind them to verify with their local district agriculture officer (Zaraat officer)."
+        )
+        
+        # Cascade across available fast models if one has high demand (503)
+        candidate_models = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"]
+        text_output = None
+        for mod in candidate_models:
+            try:
+                response = client.models.generate_content(
+                    model=mod,
+                    contents=prompt,
+                )
+                if response.text and response.text.strip():
+                    text_output = response.text.strip()
+                    break
+            except Exception:
+                continue
+        
+        if not text_output:
+            text_output = fallback["summary"]
+            
+        return {
+            "explanation": text_output,
+            "suggested_steps": fallback["steps"],
+            "source": "Gemini AI Advisor" if text_output != fallback["summary"] else "Agricultural Extension Knowledgebase (Predefined)"
+        }
+    except Exception:
+        return {
+            "explanation": fallback["summary"],
+            "suggested_steps": fallback["steps"],
+            "source": "Agricultural Extension Knowledgebase (Predefined)"
+        }
